@@ -1,6 +1,7 @@
 #! /usr/bin/env python 
 
 '''
+Anneliek ter Horst
 python script to remove vOTUs from coverage table that do not have >75% 1x coverage.
 Infiles are the is created by percentage_coverage.py, the list of vOTUs covered under 75% and 
 the coverage table itself. 

@@ -1,6 +1,7 @@
 #! /usr/bin/env python 
 
 '''
+Anneliek ter Horst
 python script to get only the <75% coverage contigs from the bed file csv
 bedtools genomecov outputs a tsv that is the input file here. This script 
 obtains the average coverage per contig. If its more than 75%, we will discard the contig.

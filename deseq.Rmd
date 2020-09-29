@@ -1,0 +1,156 @@
+# Christian Santos Medellin
+# R notebook to perform deseq2 analysis on abundance of vOTUs from spruce fieldsite
+
+```{r}
+source("../General/general_functions.R")
+library(DESeq2)
+library(biobroom)
+library(tidyverse)
+```
+
+
+Load data, reformat, and filter out vOTUs from count table that are not present in the tpm table. 
+```{r}
+map <- read.table("../Data/metadata.csv", sep = ",", header = T) %>% 
+  mutate(YearF = as.factor(Year),
+         Group = paste(Year, Depth, sep = "."))
+
+otu.tpm <- read.table("../Data/190807_all_otu_table.txt", sep = "\t", header = T)
+row.names(otu.tpm) <- otu.tpm[,1]
+otu.tpm <- otu.tpm[,-1]
+otu.tpm <- otu.tpm[,match(map$SampleID, colnames(otu.tpm))]
+otu.tpm <- otu.tpm[rowSums(otu.tpm)>0,]
+
+good.votus <- otu.tpm>0
+
+otu.count <- read.table("../Data/200922_counts_covtab_clean.csv", sep = ",", header = T)
+row.names(otu.count) <- otu.count[,2]
+otu.count <- otu.count[,-c(1,2,3)]
+otu.count <- otu.count[match(rownames(good.votus), rownames(otu.count)),match(colnames(good.votus), colnames(otu.count))]
+otu.count <- otu.count * good.votus
+```
+
+
+
+#Generate the DESeq object
+```{r}
+deseq <- DESeqDataSetFromMatrix(countData = otu.count,
+                                colData = map,
+                                design = ~ Depth + Year)
+
+## Given that every vOTU contains at least one zero, we cannot use the default DESeq algorithm to estimate size factors. An alternative is to calculate the geometric means (https://support.bioconductor.org/p/62246/#62250)
+
+cts <- counts(deseq)
+geoMeans <- apply(cts, 1, function(row) if (all(row == 0)) 0 else exp(mean(log(row[row != 0]))))
+deseq <- estimateSizeFactors(deseq, geoMeans=geoMeans)
+
+deseq <- DESeq(deseq)
+```
+
+Test which vOTUs are significantly impacterd by depth. I am treating depth as a categorical factor with 4 levels and, instead of running pairwise wald tests, I am using an LRT approach to detect any variation across depth levels. 
+```{r}
+depth.dds <- DESeq(deseq, test = "LRT", reduced = ~ Year)
+depth.res <- tidy(results(depth.dds)) %>%
+  dplyr::rename("OTU_ID" = "gene")
+
+depth.sig <- filter(depth.res, p.adjusted < 0.05)
+
+depth.sig
+```
+
+
+Perform the clustering
+```{r}
+#this calculates the zscores of each OTU_ID across samples and then calculates the man zvalue for each depth
+otu.zs <- otu.tpm %>%
+  rel_ab() %>%
+  tidy_otu() %>%
+  filter(OTU_ID %in% depth.sig$OTU_ID) %>%     ######## this is the line that you need to comment out if you want to do the clustering with the whole dataset
+  group_by(OTU_ID) %>%
+  mutate(zValue = (Count - mean(Count))/sd(Count)) %>%
+  inner_join(map, by = "SampleID") %>%
+  group_by(depth, OTU_ID) %>%
+  summarise(MeanZS = mean(zValue)) 
+
+# In order to do the clustering, you need to format it as a matrix
+otu.zs.matrix <- otu.zs %>%
+  spread(key = OTU_ID, value = MeanZS) %>%
+  as.data.frame()
+row.names(otu.zs.matrix) <- otu.zs.matrix$depth
+otu.zs.matrix <- otu.zs.matrix[,-1]
+otu.zs.matrix <- as.matrix(otu.zs.matrix)
+group.dist <- dist(otu.zs.matrix)
+otu.dist <- dist(t(otu.zs.matrix))
+
+#This part does the clustering
+otu.hc <- hclust(as.dist(otu.dist), method = "ward.D") ## you can also play with the method you are using to cluster
+otu.ord <- otu.hc$labels[otu.hc$order]
+otu.ord <- data.frame(OTU_ID = otu.ord, order = 1:length(otu.ord))
+otu.cut <- cutree(otu.hc[c(1,2,4)],k = 3) ### k will define how may clusters you are getting from your data. I used 3 because the PCoA data indicates that there are three clear groups: 10cm, 40cm, and both 100 and 150m
+otu.clusters <- data.frame(OTU_ID = names(otu.cut),
+                           Cluster = otu.cut) %>% 
+  inner_join(otu.ord, by = "OTU_ID")
+
+# plot
+otu.zs %>% 
+  inner_join(otu.clusters, by = "OTU_ID") %>% 
+  ggplot(aes(as.factor(depth), reorder(OTU_ID, order), fill = MeanZS)) +
+  geom_tile() +
+  scale_fill_distiller(name = "Mean Rel. Abund.\n(z-score)",palette = "Greys") +
+  facet_grid(Cluster ~ ., scales = "free", space = "free")
+```
+
+Calculate the hypergeometric test
+```{r}
+aquatic.votus <-  read.table("../Data/200922_vOTU_water_VC.csv", sep = ",", header = T)$SampleID
+aquatic.votus
+
+#Define how many OTUs in your 2699 detected were aquatic or not aquatic
+aquatic.uni <- sum(row.names(otu.tpm) %in% aquatic.votus)
+non.aquatic.uni <- sum(!row.names(otu.tpm) %in% aquatic.votus)
+
+# Define how many OTUs in your detected clusters are aquatic or not aquatic
+aquatic.clusters <- otu.clusters %>% 
+  mutate(Type = ifelse(OTU_ID %in% aquatic.votus, "Aquatic", "NonAquatic")) %>% 
+  group_by(Cluster, Type) %>% 
+  dplyr::count() %>% 
+  spread(key = Type, value = n, fill = 0) 
+  
+
+### Calculate the hypergeometric test per cluster
+aquatic.nest <- aquatic.clusters %>% 
+  group_by(Cluster) %>% 
+  nest 
+  
+
+## This is the function that runs the hypergeometric test. You need to use lower.tail=F to calculate overrepresentation rather than underrepresentation (https://seqqc.wordpress.com/2019/07/25/how-to-use-phyper-in-r/)
+get_hype <- function(x){
+  phyper(x$Aquatic, aquatic.uni, non.aquatic.uni, x$Aquatic + x$NonAquatic, lower.tail = F)
+}
+
+## hgt is the pvalue
+aquatic.nest %>% 
+  mutate(hgt = map(data, get_hype)) %>% 
+  unnest(hgt)
+```
+
+Two ways to visualize how the proportion of aquatic vOTUs in each cluster compares to the proportion observed in the whole dataset
+```{r}
+aquatic.clusters %>% 
+  ungroup() %>% 
+  mutate(Cluster = as.character(Cluster)) %>% 
+  add_row(Cluster = "Total", Aquatic = aquatic.uni, NonAquatic = non.aquatic.uni) %>% 
+  gather(key = "Type", value = "nOTUs", -Cluster) %>% 
+  ggplot(aes(Cluster, nOTUs, fill = Type)) +
+  geom_bar(stat = "identity", position = "fill")
+
+aquatic.clusters %>% 
+  ungroup() %>% 
+  mutate(Cluster = as.character(Cluster)) %>% 
+  add_row(Cluster = "Total", Aquatic = aquatic.uni, NonAquatic = non.aquatic.uni) %>% 
+  group_by(Cluster) %>% 
+  mutate(PercentAquatic = Aquatic/sum(Aquatic + NonAquatic)) %>% 
+  ggplot(aes(Cluster, PercentAquatic)) +
+  geom_bar(stat = "identity")
+```
+
